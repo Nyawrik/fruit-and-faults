@@ -1,0 +1,273 @@
+package org.fruitandfaults.validation.infra;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.Objects;
+import java.util.stream.Stream;
+
+import org.fruitandfaults.validation.application.ProcessResult;
+import org.fruitandfaults.validation.domain.CheckOutcome;
+import org.fruitandfaults.validation.domain.Diagnostic;
+import org.fruitandfaults.validation.domain.FailureCategory;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
+
+class GradleCheckClassifierTest {
+  private final GradleCheckClassifier classifier = new GradleCheckClassifier();
+
+  @ParameterizedTest
+  @MethodSource("failures")
+  void classifiesOnlyRecognizableTaskFailuresAndProvidesUsefulNextAction(
+      String fixture, FailureCategory category, String observed, String action) throws IOException {
+    ProcessResult result = new ProcessResult.Exited(1, output("", fixture(fixture)));
+    CheckOutcome.Failed outcome =
+        assertInstanceOf(CheckOutcome.Failed.class, classifier.classify(result));
+
+    assertEquals(category, outcome.category());
+    Diagnostic diagnostic = outcome.diagnostics().getFirst();
+    assertFalse(diagnostic.expected().isBlank());
+    assertTrue(diagnostic.observed().contains(observed), diagnostic.observed());
+    assertTrue(diagnostic.nextAction().contains(action), diagnostic.nextAction());
+    assertFalse(diagnostic.observed().contains("/workspace"));
+    assertFalse(diagnostic.observed().contains("SECRET_TOKEN"));
+    assertFalse(diagnostic.observed().contains("Caused by:"));
+  }
+
+  private static Stream<Arguments> failures() {
+    return Stream.of(
+        Arguments.of(
+            "compile.txt", FailureCategory.COMPILATION_ERROR, "Starter.java:7", "source location"),
+        Arguments.of(
+            "compile-tests.txt",
+            FailureCategory.COMPILATION_ERROR,
+            "MovementTest.java:12",
+            "source location"),
+        Arguments.of(
+            "test-failure.txt",
+            FailureCategory.TEST_FAILURE,
+            "Visible JUnit tests failed",
+            "test report"),
+        Arguments.of(
+            "configuration.txt", FailureCategory.INTERNAL_ERROR, "exit code 1", "toolchain"),
+        Arguments.of(
+            "missing-wrapper.txt",
+            FailureCategory.MISSING_ARTIFACT,
+            "Gradle wrapper",
+            "wrapper files"),
+        Arguments.of(
+            "missing-wrapper-windows.txt",
+            FailureCategory.MISSING_ARTIFACT,
+            "Gradle wrapper",
+            "wrapper files"),
+        Arguments.of(
+            "missing-wrapper-jar.txt",
+            FailureCategory.MISSING_ARTIFACT,
+            "Gradle wrapper",
+            "wrapper files"),
+        Arguments.of("unknown.txt", FailureCategory.INTERNAL_ERROR, "exit code 1", "toolchain"));
+  }
+
+  @Test
+  void zeroExitIsSuccessfulEvenWhenOutputContainsDiagnosticWords() throws IOException {
+    CheckOutcome.Passed outcome =
+        assertInstanceOf(
+            CheckOutcome.Passed.class,
+            classifier.classify(new ProcessResult.Exited(0, output(fixture("compile.txt"), ""))));
+    assertFalse(outcome.diagnostics().isEmpty());
+  }
+
+  @Test
+  void missingTaskOrErrorEvidenceDoesNotBlameLearnerSource() {
+    for (String incomplete :
+        new String[] {
+          "Starter.java:7: error: cannot find symbol\n",
+          "> Task :compileJava FAILED\nPlugin cannot be loaded\n",
+          "> Task :test FAILED\nTest worker could not start\n",
+          "There were failing tests.\n",
+          "> Task :test FAILED\nGradle Test Executor 1 > failed to execute tests FAILED\n> There were failing tests.\n",
+          "> Task :compileJava FAILED\nStarter.java:7: error: cannot find symbol\n> Task :test FAILED\nThere were failing tests.\n"
+        }) {
+      CheckOutcome.Failed outcome =
+          assertInstanceOf(
+              CheckOutcome.Failed.class,
+              classifier.classify(new ProcessResult.Exited(7, output(incomplete, ""))));
+      assertEquals(FailureCategory.INTERNAL_ERROR, outcome.category());
+    }
+  }
+
+  @Test
+  void longUntrustedLineWithoutSourceEvidenceIsClassifiedWithinBoundedTime() {
+    String captured = "> Task :compileJava FAILED\n" + "x".repeat(100_000) + "\n";
+    CheckOutcome.Failed outcome =
+        assertInstanceOf(
+            CheckOutcome.Failed.class,
+            assertTimeoutPreemptively(
+                Duration.ofSeconds(2),
+                () -> classifier.classify(new ProcessResult.Exited(1, output(captured, "")))));
+    assertEquals(FailureCategory.INTERNAL_ERROR, outcome.category());
+  }
+
+  @Test
+  void sanitizesTerminalControlsAndPreservesUsefulRelativeSourceLocation() throws IOException {
+    String captured = "\u001b[31m" + fixture("compile.txt") + "\u001b[0m";
+    captured = captured.replace("cannot find symbol", "cannot\u0007 find symbol");
+    CheckOutcome.Failed outcome =
+        assertInstanceOf(
+            CheckOutcome.Failed.class,
+            classifier.classify(new ProcessResult.Exited(1, output(captured, ""))));
+    assertEquals(FailureCategory.COMPILATION_ERROR, outcome.category());
+    assertEquals(
+        "Java compilation failed at Starter.java:7.", outcome.diagnostics().getFirst().observed());
+    assertFalse(outcome.diagnostics().toString().contains("\u001b"));
+    assertFalse(outcome.diagnostics().toString().contains("\u0007"));
+  }
+
+  @ParameterizedTest
+  @ValueSource(
+      strings = {
+        "SECRET_TOKEN=fake",
+        "see /Users/vlad/private/file and C:\\private\\token",
+        "unexpected \u202ESECRET_TOKEN=fake\u2066"
+      })
+  void compilerObservationContainsOnlyRelativeLocationAndGenericFailure(String suffix) {
+    String captured =
+        "> Task :compileJava FAILED\n/workspace/private/Starter.java:7: error: " + suffix + "\n";
+    CheckOutcome.Failed outcome =
+        assertInstanceOf(
+            CheckOutcome.Failed.class,
+            classifier.classify(new ProcessResult.Exited(1, output(captured, ""))));
+    assertEquals(FailureCategory.COMPILATION_ERROR, outcome.category());
+    assertEquals(
+        "Java compilation failed at Starter.java:7.", outcome.diagnostics().getFirst().observed());
+    assertFalse(outcome.diagnostics().toString().contains("SECRET_TOKEN"));
+    assertFalse(outcome.diagnostics().toString().contains("/Users/vlad"));
+    assertFalse(outcome.diagnostics().toString().contains("C:\\private"));
+    assertFalse(outcome.diagnostics().toString().contains("\u202E"));
+    assertFalse(outcome.diagnostics().toString().contains("\u2066"));
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"\u202E", "\u2066", "\u200B"})
+  void removesUnicodeFormatControlsBeforeRecognizingRelativeSourceLocation(String control) {
+    String captured =
+        "> Task :compileJava FAILED\n/workspace/Sta"
+            + control
+            + "rter.java:7: error: ordinary compilation detail\n";
+    CheckOutcome.Failed outcome =
+        assertInstanceOf(
+            CheckOutcome.Failed.class,
+            classifier.classify(new ProcessResult.Exited(1, output(captured, ""))));
+    assertEquals(FailureCategory.COMPILATION_ERROR, outcome.category());
+    assertEquals(
+        "Java compilation failed at Starter.java:7.", outcome.diagnostics().getFirst().observed());
+    assertFalse(outcome.diagnostics().toString().contains(control));
+  }
+
+  @Test
+  void explainsRetainedTailWhenOutputIsTruncated() {
+    ProcessResult.Output output = new ProcessResult.Output("tail", "", true, false);
+    CheckOutcome.Failed outcome =
+        assertInstanceOf(
+            CheckOutcome.Failed.class, classifier.classify(new ProcessResult.Exited(1, output)));
+    assertEquals(FailureCategory.INTERNAL_ERROR, outcome.category());
+    assertTrue(
+        outcome.diagnostics().stream()
+            .anyMatch(diagnostic -> diagnostic.observed().contains("truncated")));
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"truncated", "unknown-exit", "output-failure"})
+  void directsBuildOutputInspectionToTheLocalWrapperWithoutPromisingVerboseCapture(String kind) {
+    ProcessResult result =
+        kind.equals("output-failure")
+            ? new ProcessResult.Failed(
+                ProcessResult.FailureReason.OUTPUT_FAILURE, "SECRET", ProcessResult.Output.empty())
+            : new ProcessResult.Exited(
+                1, new ProcessResult.Output("tail", "", kind.equals("truncated"), false));
+    var outcome = assertInstanceOf(CheckOutcome.Failed.class, classifier.classify(result));
+    var diagnostic =
+        kind.equals("truncated")
+            ? outcome.diagnostics().getLast()
+            : outcome.diagnostics().getFirst();
+    assertEquals(
+        switch (kind) {
+          case "truncated" ->
+              "Rerun the local wrapper test command with --offline and the prepared Gradle user home to inspect complete build output.";
+          case "unknown-exit" ->
+              "Inspect the local wrapper and Java toolchain; rerun the wrapper test command with --offline and the prepared Gradle user home for build output.";
+          default ->
+              "Inspect the local toolchain and rerun the local wrapper test command with --offline and the prepared Gradle user home for build output.";
+        },
+        diagnostic.nextAction());
+    assertFalse(outcome.diagnostics().toString().contains("--verbose"));
+    assertFalse(outcome.diagnostics().toString().contains("SECRET"));
+  }
+
+  @Test
+  void distinguishesTimeoutInterruptionAndLaunchFailureFromLearnerFailures() {
+    assertCategory(
+        FailureCategory.TIMEOUT,
+        new ProcessResult.TimedOut(ProcessResult.Output.empty(), ProcessResult.Cleanup.COMPLETE));
+    assertCategory(
+        FailureCategory.INTERRUPTED,
+        new ProcessResult.Interrupted(
+            ProcessResult.Output.empty(), ProcessResult.Cleanup.COMPLETE));
+    for (ProcessResult.FailureReason reason : ProcessResult.FailureReason.values()) {
+      CheckOutcome.Failed outcome =
+          assertCategory(
+              FailureCategory.INTERNAL_ERROR,
+              new ProcessResult.Failed(
+                  reason, "SECRET_TOKEN=untrusted\u001b", ProcessResult.Output.empty()));
+      assertFalse(outcome.diagnostics().toString().contains("SECRET_TOKEN"));
+    }
+  }
+
+  @Test
+  void reportsIncompleteAndUnsupportedCleanupInsteadOfImplyingTreeStopped() {
+    for (ProcessResult.Cleanup cleanup :
+        new ProcessResult.Cleanup[] {
+          ProcessResult.Cleanup.INCOMPLETE, ProcessResult.Cleanup.UNSUPPORTED
+        }) {
+      CheckOutcome.Failed outcome =
+          assertCategory(
+              FailureCategory.TIMEOUT,
+              new ProcessResult.TimedOut(ProcessResult.Output.empty(), cleanup));
+      assertTrue(
+          outcome.diagnostics().stream()
+              .anyMatch(
+                  diagnostic -> diagnostic.nextAction().contains("remaining local processes")));
+    }
+  }
+
+  private CheckOutcome.Failed assertCategory(FailureCategory category, ProcessResult result) {
+    CheckOutcome.Failed outcome =
+        assertInstanceOf(CheckOutcome.Failed.class, classifier.classify(result));
+    assertEquals(category, outcome.category());
+    assertFalse(outcome.diagnostics().getFirst().expected().isBlank());
+    assertFalse(outcome.diagnostics().getFirst().observed().isBlank());
+    assertFalse(outcome.diagnostics().getFirst().nextAction().isBlank());
+    return outcome;
+  }
+
+  private static ProcessResult.Output output(String stdout, String stderr) {
+    return new ProcessResult.Output(stdout, stderr, false, false);
+  }
+
+  private static String fixture(String name) throws IOException {
+    try (var input =
+        Objects.requireNonNull(
+            GradleCheckClassifierTest.class.getResourceAsStream("/process-fixtures/" + name))) {
+      return new String(input.readAllBytes(), StandardCharsets.UTF_8);
+    }
+  }
+}
