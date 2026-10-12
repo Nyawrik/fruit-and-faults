@@ -12,6 +12,11 @@ class AnalogousBoundaryTest {
     // Act: request a movement outward from that edge.
     // Assert: compare the returned coordinate and status with the public rule.
     // Explain why the chosen candidate is outside the board.
-    fail("Complete this analogous boundary test.");
+    Board board = new Board(3, 2);
+    Coordinate original = new Coordinate(2, 1);
+    MoveResult result = Movement.move(original, Direction.RIGHT, board);
+    assertEquals(original, result.coordinate());
+    assertEquals(MoveStatus.BLOCKED, result.status());
+
   }
 }
